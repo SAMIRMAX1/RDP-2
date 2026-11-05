@@ -1,0 +1,143 @@
+# تحديد المتغيرات الافتراضية التي يمكن تعديلها عند التشغيل اليدوي
+variables:
+  TAILSCALE_AUTHKEY:
+    value: ""
+    description: "ضع هنا كود Tailscale Auth Key (إجباري)"
+  RDP_PASSWORD:
+    value: ""
+    description: "كلمة مرور مستخدم RDP (اتركها فارغة للتوليد التلقائي)"
+  KEEP_ALIVE_MINUTES:
+    value: "120"
+    description: "مدة إبقاء الجلسة تعمل بالدقائق"
+
+stages:
+  - setup
+
+setup-rdp-tailscale:
+  stage: setup
+  tags:
+    - windows # توجيه المهمة للعمل على خوادم ويندوز مشتركة داخل GitLab
+  timeout: 150m # تحديد الحد الأقصى لوقت التشغيل بـ 150 دقيقة
+  script:
+    # 1. إعدادات الـ RDP الأساسية
+    - |
+      Write-Host "=== Configuring Remote Desktop (Secure Mode) ==="
+      Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+      Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 1 -Force
+      Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 1 -Force
+      Restart-Service -Name TermService -Force -ErrorAction SilentlyContinue
+      Start-Sleep -Seconds 5
+      Write-Host "NLA Enabled. RDP is now more secure."
+
+    # 2. إعدادات جدار الحماية (Firewall)
+    - |
+      Write-Host "=== Configuring Strict Firewall ==="
+      $existingRule = Get-NetFirewallRule -DisplayName "RDP-Tailscale" -ErrorAction SilentlyContinue
+      if ($existingRule) {
+          Remove-NetFirewallRule -DisplayName "RDP-Tailscale" -Confirm:$false
+      }
+      New-NetFirewallRule -DisplayName "RDP-Tailscale" -Direction Inbound -Protocol TCP -LocalPort 3389 -Action Allow -Profile Any -Description "Allow RDP access via Tailscale Tunnel"
+      Write-Host "Firewall configured. Note: Access is secured by Tailscale tunnel + NLA."
+
+    # 3. إنشاء مستخدم الـ RDP
+    - |
+      Write-Host "=== Creating RDP User ==="
+      $inputPassword = "$CI_VARIABLE_RDP_PASSWORD"
+      $userName = "RDP"
+      
+      if ([string]::IsNullOrWhiteSpace($inputPassword)) {
+          $inputPassword = -join ((65..90) + (97..122) + (48..57) | Get-Random -Count 16 | ForEach-Object {[char]$_})
+          Write-Host "Generated random password: $inputPassword"
+          $env:GENERATED_PASSWORD = $inputPassword
+          $finalPassword = $inputPassword
+      } else {
+          $finalPassword = $inputPassword
+      }
+
+      $securePass = ConvertTo-SecureString $finalPassword -AsPlainText -Force
+      $userExists = Get-LocalUser -Name $userName -ErrorAction SilentlyContinue
+
+      if ($userExists) {
+          Write-Host "User '$userName' exists. Updating password."
+          Set-LocalUser -Name $userName -Password $securePass
+      } else {
+          Write-Host "Creating new user '$userName'."
+          New-LocalUser -Name $userName -Password $securePass -AccountNeverExpires -Description "Secure RDP User"
+      }
+
+      Add-LocalGroupMember -Group "Remote Desktop Users" -Member $userName
+      # إذا كنت تريد صلاحيات المسؤول (Admin) قم بإزالة علامة الـ # من السطر التالي:
+      # Add-LocalGroupMember -Group "Administrators" -Member $userName 
+
+      $env:RDP_USER = $userName
+
+    # 4. تثبيت برنامج Tailscale
+    - |
+      Write-Host "=== Installing Tailscale ==="
+      $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+      $installerPath = "$env:TEMP\tailscale-installer.msi"
+      
+      try {
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -UseBasicParsing
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+          Write-Host "Tailscale installed successfully."
+      } catch {
+          Write-Error "Failed to install Tailscale: $_"
+          exit 1
+      }
+
+    # 5. بدء اتصال Tailscale
+    - |
+      Write-Host "=== Connecting to Tailscale ==="
+      $authKey = "$TAILSCALE_AUTHKEY"
+      if ([string]::IsNullOrWhiteSpace($authKey)) {
+          Write-Error "Error: TAILSCALE_AUTHKEY variable is empty! Please provide it when running the pipeline."
+          exit 1
+      }
+      $hostname = "gl-runner-$CI_PIPELINE_ID"
+      
+      & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey="$authKey" --hostname="$hostname" --reset
+
+      $tsIP = $null
+      $maxRetries = 30
+      $retryCount = 0
+      
+      while (-not $tsIP -and $retryCount -lt $maxRetries) {
+          Start-Sleep -Seconds 3
+          try {
+              $ipOutput = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              $tsIP = $ipOutput.Trim()
+              if ($tsIP -match "^\d+\.\d+\.\d+\.\d+$") { break }
+              $tsIP = $null
+          } catch { $tsIP = $null }
+          $retryCount++
+      }
+
+      if (-not $tsIP) {
+          Write-Error "Tailscale IP not assigned."
+          exit 1
+      }
+
+      Write-Host "Tailscale connected with IP: $tsIP"
+      $env:TAILSCALE_IP = $tsIP
+
+    # 6. التحقق من عمل الـ RDP
+    - |
+      Write-Host "=== Verifying RDP Connectivity ==="
+      $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -InformationLevel Quiet
+      if ($testResult) {
+          Write-Host "✅ SUCCESS: RDP is accessible via Tailscale."
+      } else {
+          Write-Error "❌ FAILURE: RDP port 3389 is not reachable."
+          exit 1
+      }
+
+    # 7. إبقاء الجلسة حية (Keep-Alive)
+    - |
+      $durationMinutes = [int]"$KEEP_ALIVE_MINUTES"
+      Write-Host "=== Keeping Session Alive for $durationMinutes Minutes ==="
+      for ($i = 0; $i -lt $durationMinutes; $i++) {
+          Start-Sleep -Seconds 60
+          Write-Host "Session is still active... ($($i+1)/$durationMinutes minutes)"
+      }
